@@ -6,3 +6,7 @@ This tool displays real-time map visualizations of recent changes in Wikidata, u
 
 - Real-time map of recent edits on Wikidata.
 - Clickable map markers to view details of each edit (WD item, Sitelinks).
+
+## Contributors
+- [Jinoy Tom Jacob](https://github.com/gnoeee)
+- [Athul V](https://github.com/athulvis)
