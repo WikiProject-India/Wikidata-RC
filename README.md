@@ -13,4 +13,4 @@ This tool displays real-time map visualizations of recent changes in Wikidata, u
 
 ## Contributors
 - [Jinoy Tom Jacob](https://github.com/gnoeee)
-- [Athul V](https://github.com/athulvis)
+- [Athul R T](https://github.com/athulvis)
