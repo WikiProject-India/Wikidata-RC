@@ -1,82 +1,447 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Wikidata Edits Heatmap</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <style>
-    body { margin: 0; padding: 0; }
-    #map { height: 100vh; }
-    .leaflet-container {
-      border: none !important;
-    }
-  </style>
+    <meta charset="utf-8">
+    <title>Wikidata Edits Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+
+        #map {
+            height: 100vh;
+        }
+
+        .leaflet-container {
+            border: none !important;
+        }
+
+        .ores-box {
+            width: 16px;
+            height: 16px;
+            display: inline-block;
+            margin-right: 5px;
+            border: 1px solid #ccc;
+        }
+    </style>
 </head>
 <body>
-  <div id='map'></div>
+    <div id='map'></div>
+    <script>
+        const map = L.map('map').setView([20, 0], 2);
+        L.tileLayer('https://tile.openstreetmap.bzh/ca/{z}/{x}/{y}.png',{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
 
-  <script>
+        //  Attempt to use a proxy.
+        const eventSourceUrl = 'https://stream.wikimedia.org/v2/stream/revision-create';
+        const eventSource = new EventSource(eventSourceUrl);
 
+        const heatMapData = [];
+        let currentPopup;
 
-    const eventSource = new EventSource('https://stream.wikimedia.org/v2/stream/revision-create');
-    const heatMapData = [];
-    let currentPopup;
+        const ORES_API_URL = 'https://ores.wikimedia.org/v3/scores/wikidatawiki/';
+        const ORES_MODEL = 'damaging';
+        const ORES_COLOR_STEPS = [
+            { probability: 0.1, color: 'red', label: 'Very Damaging' },
+            { probability: 0.3, color: 'orange', label: 'Damaging' },
+            { probability: 0.5, color: 'yellow', label: 'Moderately Damaging' },
+            { probability: 0.7, color: 'lightgreen', label: 'Slightly Damaging' },
+            { probability: 1.0, color: 'green', label: 'Not Damaging' },
+        ];
 
-    eventSource.onmessage = event => {
-      const data = JSON.parse(event.data);
-      if (data.database !== 'wikidatawiki') return;
-      const qid = data.meta.uri.split('/').pop();
+        eventSource.onmessage = event => {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.database === 'wikidatawiki' && data.rev_content_model !== 'wikibase-lexem') {
+                    const qid = data.meta.uri.split('/').pop();
+                    const newRevId = data.rev_id;
+                    const oldRevId = data.rev_parent_id;
 
-      fetch(`https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&props=claims|sitelinks&ids=${qid}&languages=en&origin=*`)
-        .then(res => res.json())
-        .then(json => process_edit(json, qid))
-        .catch(console.error);
-    }
+                    if (!qid) {
+                        console.error(`Error: QID is invalid or missing from the event data. Skipping this event.`);
+                        return;
+                    }
 
-    const process_edit = (data, qid) => {
-      if (!data.entities[qid]?.claims?.P625) return;
-      const coordinates = data.entities[qid].claims.P625[0].mainsnak.datavalue.value;
-      const lat = coordinates.latitude;
-      const lng = coordinates.longitude;
+                    fetch(`https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&props=labels|claims|sitelinks&ids=${qid}&languages=en&origin=*`)
+                        .then(res => {
+                            if (!res.ok) {
+                                throw new Error(`HTTP error! status: ${res.status}`);
+                            }
+                            return res.json();
+                        })
+                        .then(json => {
+                            processWikidataEdit(json, qid, newRevId, oldRevId);
+                        })
+                        .catch(error => console.error("Error fetching or processing data:", error));
+                }
+            } catch (e) {
+                console.error("Error parsing event data:", e);
+            }
+        };
 
-      const circle = L.circle([lat, lng], 5, { fillColor: 'darkred', color: 'darkred', fillOpacity: 1 }).addTo(map);
-      circle.qid = qid;
-      heatMapData.push(circle);
+        eventSource.onerror = error => {
+            console.error("EventSource error:", error);
+            eventSource.close();
+            eventSource = new EventSource(eventSourceUrl);
+        };
 
-      circle.on('mouseover', () => {
-        const sitelinksHtml = Object.values(data.entities[qid].sitelinks)
-          .map(link => {
-            const site = link.site.replace('wiki', '');
-            const domain = site === 'commons' ? 'wikimedia' : (site === 'wikivoyage' ? 'wikivoyage' : 'wikipedia');
-            return `<a href="https://${site}.${domain}.org/wiki/${encodeURIComponent(link.title)}" target="_blank" onclick="event.stopPropagation()">${site}</a>`;
-          })
-          .join(', ');
-        const popupContent = `<a href="https://www.wikidata.org/wiki/${qid}" target="_blank">${qid}</a><br><b>Sitelinks:</b> ${sitelinksHtml}`;
-        currentPopup = L.popup().setLatLng([lat, lng]).setContent(popupContent).openOn(map);
-      });
-    };
+        function getColor(probability) {
+            for (let i = 0; i < ORES_COLOR_STEPS.length; i++) {
+                if (probability <= ORES_COLOR_STEPS[i].probability) {
+                    return ORES_COLOR_STEPS[i];
+                }
+            }
+            return { color: 'blue', label: 'Not predicted' };
+        }
 
-    // Call removeMapBorder function after map initialization
-    setTimeout(removeMapBorder, 0);
-  </script>
+        function processWikidataEdit(data, qid, newRevId, oldRevId) {
+            const entity = data.entities[qid];
+            if (!entity || !entity.claims || !entity.claims.P625) {
+                return;
+            }
+            const coordinates = entity.claims.P625[0].mainsnak.datavalue.value;
+            const lat = coordinates.latitude;
+            const lng = coordinates.longitude;
+            const label = entity.labels?.en?.value || "No label";
 
+            let circleColor = 'blue';
+            let popupContent = `<a href="https://www.wikidata.org/wiki/${qid}" target="_blank" rel="noopener noreferrer">${qid}</a> (${label})<br>`;
+            const sitelinks = entity.sitelinks || {};
+            const sitelinkCount = Object.keys(sitelinks).length;
+            const sitelinksHtml = Object.values(sitelinks)
+                .slice(0, 5)
+                .map(link => {
+                    const site = link.site.replace('wiki', '');
+                    const domain = site === 'commons' ? 'wikimedia' : (site === 'wikivoyage' ? 'wikivoyage' : 'wikipedia');
+                    return `<a href="https://${site}.${domain}.org/wiki/${encodeURIComponent(link.title)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${site}</a>`;
+                })
+                .join(', ');
+            popupContent += `<b>Sitelinks:</b> ${sitelinkCount} (${sitelinksHtml})<br>`;
 
-<script>
-const map = L.map('map').setView([20, 0], 2); // Centered at [latitude, longitude] and zoom level
+            const circle = L.circle([lat, lng], 5, {
+                fillColor: circleColor,
+                color: circleColor,
+                fillOpacity: 1
+            }).addTo(map);
+            circle.qid = qid;
+            heatMapData.push(circle);
 
-// Define the OpenStreetMap_CAT tile layer
-const OpenStreetMap_CAT = L.tileLayer('https://tile.openstreetmap.bzh/ca/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, Tiles courtesy of <a href="https://www.openstreetmap.cat" target="_blank">Breton OpenStreetMap Team</a>'
-});
+            if (newRevId) {
+                const oresUrl = `${ORES_API_URL}${newRevId}/damaging`;
+                fetch(oresUrl)
+                    .then(oresRes => {
+                        if (!oresRes.ok) {
+                            return oresRes.text().then(text => {
+                                throw new Error(`ORES API error! status: ${oresRes.status}, body: ${text}`);
+                            });
+                        }
+                        return oresRes.json();
+                    })
+                    .then(oresData => {
+                        if (oresData && oresData.hasOwnProperty('error')) {
+                            console.error("ORES API returned an error:", oresData.error);
+                            circleColor = 'blue';
+                            const qualityLabel = 'ORES Error';
+                            popupContent += `<b>Edit Quality:</b> <span class="ores-box" style="background-color: ${circleColor};"></span>${qualityLabel}`;
+                            if (newRevId && oldRevId) {
+                                fetch(`https://www.wikidata.org/w/api.php?action=compare&format=json&fromrev=${oldRevId}&torev=${newRevId}&origin=*`)
+                                    .then(res => {
+                                        if (!res.ok) {
+                                            throw new Error(`HTTP error! status: ${res.status}`);
+                                        }
+                                        return res.text();
+                                    })
+                                    .then(diffHtml => {
+                                        const parser = new DOMParser();
+                                        const doc = parser.parseFromString(diffHtml, "text/html");
+                                        const diffElement = doc.querySelector(".diff");
+                                        let diffContent = "No diff available";
+                                        if (diffElement) {
+                                            diffContent = diffElement.outerHTML;
+                                        }
+                                        popupContent += `<b>Diff:</b><br>${diffContent}`;
+                                        circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                        const popup = L.popup()
+                                            .setLatLng([lat, lng])
+                                            .setContent(popupContent)
+                                            .addTo(map);
 
-// Add the tile layer to the map
-OpenStreetMap_CAT.addTo(map);
+                                        if (currentPopup) {
+                                            map.closePopup(currentPopup);
+                                        }
+                                        currentPopup = popup;
 
-</script>
+                                        circle.on('mouseover', () => {
+                                            popup.openOn(map);
+                                        });
 
+                                        setTimeout(() => {
+                                            map.closePopup(popup);
+                                        }, 20000);
+                                    })
+                                    .catch(error => {
+                                        console.error("Error fetching diff data:", error);
+                                        popupContent += `<br><b>Diff:</b><br>Diff Not Available`;
+                                        circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                        const popup = L.popup()
+                                            .setLatLng([lat, lng])
+                                            .setContent(popupContent)
+                                            .addTo(map);
 
+                                        if (currentPopup) {
+                                            map.closePopup(currentPopup);
+                                        }
+                                        currentPopup = popup;
 
+                                        circle.on('mouseover', () => {
+                                            popup.openOn(map);
+                                        });
+
+                                        setTimeout(() => {
+                                            map.closePopup(popup);
+                                        }, 20000);
+                                    });
+                            }
+                            else {
+                                circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                const popup = L.popup()
+                                    .setLatLng([lat, lng])
+                                    .setContent(popupContent)
+                                    .addTo(map);
+
+                                if (currentPopup) {
+                                    map.closePopup(currentPopup);
+                                }
+                                currentPopup = popup;
+
+                                circle.on('mouseover', () => {
+                                    popup.openOn(map);
+                                });
+
+                                setTimeout(() => {
+                                    map.closePopup(popup);
+                                }, 20000);
+                            }
+                        }
+                        else if (oresData && oresData.wikidatawiki && oresData.wikidatawiki.scores && oresData.wikidatawiki.scores[newRevId] && oresData.wikidatawiki.scores[newRevId].damaging) {
+                            const damagingProbability = oresData.wikidatawiki.scores[newRevId].damaging.score.probability.false;
+                            const colorInfo = getColor(damagingProbability);
+                            circleColor = colorInfo.color;
+                            const qualityLabel = colorInfo.label;
+                            popupContent += `<b>Edit Quality:</b> <span class="ores-box" style="background-color: ${circleColor};"></span>${qualityLabel}`;
+                            if (newRevId && oldRevId) {
+                                fetch(`https://www.wikidata.org/w/api.php?action=compare&format=json&fromrev=${oldRevId}&torev=${newRevId}&origin=*`)
+                                    .then(res => {
+                                        if (!res.ok) {
+                                            throw new Error(`HTTP error! status: ${res.status}`);
+                                        }
+                                        return res.text();
+                                    })
+                                    .then(diffHtml => {
+                                        const parser = new DOMParser();
+                                        const doc = parser.parseFromString(diffHtml, "text/html");
+                                        const diffElement = doc.querySelector(".diff");
+                                        let diffContent = "No diff available";
+                                        if (diffElement) {
+                                            diffContent = diffElement.outerHTML;
+                                        }
+                                        popupContent += `<b>Diff:</b><br>${diffContent}`;
+                                        circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                        const popup = L.popup()
+                                            .setLatLng([lat, lng])
+                                            .setContent(popupContent)
+                                            .addTo(map);
+
+                                        if (currentPopup) {
+                                            map.closePopup(currentPopup);
+                                        }
+                                        currentPopup = popup;
+
+                                        circle.on('mouseover', () => {
+                                            popup.openOn(map);
+                                        });
+
+                                        setTimeout(() => {
+                                            map.closePopup(popup);
+                                        }, 20000);
+                                    })
+                                    .catch(error => {
+                                        console.error("Error fetching diff data:", error);
+                                        popupContent += `<br><b>Diff:</b><br>Diff Not Available`;
+                                        circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                        const popup = L.popup()
+                                            .setLatLng([lat, lng])
+                                            .setContent(popupContent)
+                                            .addTo(map);
+
+                                        if (currentPopup) {
+                                            map.closePopup(currentPopup);
+                                        }
+                                        currentPopup = popup;
+
+                                        circle.on('mouseover', () => {
+                                            popup.openOn(map);
+                                        });
+
+                                        setTimeout(() => {
+                                            map.closePopup(popup);
+                                        }, 20000);
+                                    });
+                            }
+                            else {
+                                circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                const popup = L.popup()
+                                    .setLatLng([lat, lng])
+                                    .setContent(popupContent)
+                                    .addTo(map);
+
+                                if (currentPopup) {
+                                    map.closePopup(currentPopup);
+                                }
+                                currentPopup = popup;
+
+                                circle.on('mouseover', () => {
+                                    popup.openOn(map);
+                                });
+
+                                setTimeout(() => {
+                                    map.closePopup(popup);
+                                }, 20000);
+                            }
+                        }
+                        else {
+                            console.error("ORES response is missing expected data:", oresData);
+                            console.log("Full ORES response:", oresData);
+                            circleColor = 'blue';
+                            const qualityLabel = 'ORES Error';
+                            popupContent += `<b>Edit Quality:</b> <span class="ores-box" style="background-color: ${circleColor};"></span>${qualityLabel}`;
+                            if (newRevId && oldRevId) {
+                                fetch(`https://www.wikidata.org/w/api.php?action=compare&format=json&fromrev=${oldRevId}&torev=${newRevId}&origin=*`)
+                                    .then(res => {
+                                        if (!res.ok) {
+                                            throw new Error(`HTTP error! status: ${res.status}`);
+                                        }
+                                        return res.text();
+                                    })
+                                    .then(diffHtml => {
+                                        const parser = new DOMParser();
+                                        const doc = parser.parseFromString(diffHtml, "text/html");
+                                        const diffElement = doc.querySelector(".diff");
+                                        let diffContent = "No diff available";
+                                        if (diffElement) {
+                                            diffContent = diffElement.outerHTML;
+                                        }
+                                        popupContent += `<b>Diff:</b><br>${diffContent}`;
+                                        circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                        const popup = L.popup()
+                                            .setLatLng([lat, lng])
+                                            .setContent(popupContent)
+                                            .addTo(map);
+
+                                        if (currentPopup) {
+                                            map.closePopup(currentPopup);
+                                        }
+                                        currentPopup = popup;
+
+                                        circle.on('mouseover', () => {
+                                            popup.openOn(map);
+                                        });
+
+                                        setTimeout(() => {
+                                            map.closePopup(popup);
+                                        }, 20000);
+                                    })
+                                    .catch(error => {
+                                        console.error("Error fetching diff data:", error);
+                                        popupContent += `<br><b>Diff:</b><br>Diff Not Available`;
+                                        circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                        const popup = L.popup()
+                                            .setLatLng([lat, lng])
+                                            .setContent(popupContent)
+                                            .addTo(map);
+
+                                        if (currentPopup) {
+                                            map.closePopup(currentPopup);
+                                        }
+                                        currentPopup = popup;
+
+                                        circle.on('mouseover', () => {
+                                            popup.openOn(map);
+                                        });
+
+                                        setTimeout(() => {
+                                            map.closePopup(popup);
+                                        }, 20000);
+                                    });
+                            }
+                            else {
+                                circle.setStyle({ fillColor: circleColor, color: circleColor });
+                                const popup = L.popup()
+                                    .setLatLng([lat, lng])
+                                    .setContent(popupContent)
+                                    .addTo(map);
+
+                                if (currentPopup) {
+                                    map.closePopup(popup);
+                                }
+                                currentPopup = popup;
+
+                                circle.on('mouseover', () => {
+                                    popup.openOn(map);
+                                });
+
+                                setTimeout(() => {
+                                    map.closePopup(popup);
+                                }, 20000);
+                            }
+                        }
+                    })
+                    .catch(error => {
+                        console.error("Error fetching ORES data:", error);
+                        circle.setStyle({ fillColor: circleColor, color: circleColor });
+                        popupContent += `<br><b>Edit Quality:</b> Unknown`;
+                        const popup = L.popup()
+                            .setLatLng([lat, lng])
+                            .setContent(popupContent)
+                            .addTo(map);
+
+                        if (currentPopup) {
+                            map.closePopup(currentPopup);
+                        }
+                        currentPopup = popup;
+
+                        circle.on('mouseover', () => {
+                            popup.openOn(map);
+                        });
+                         setTimeout(() => {
+                            map.closePopup(popup);
+                        }, 20000);
+                    });
+            }
+            else{
+                 const popup = L.popup()
+                    .setLatLng([lat, lng])
+                    .setContent(popupContent)
+                    .addTo(map);
+
+                if (currentPopup) {
+                    map.closePopup(currentPopup);
+                }
+                currentPopup = popup;
+
+                circle.on('mouseover', () => {
+                    popup.openOn(map);
+                });
+                 setTimeout(() => {
+                    map.closePopup(popup);
+                }, 20000);
+            }
+        }
+    </script>
 </body>
 </html>
